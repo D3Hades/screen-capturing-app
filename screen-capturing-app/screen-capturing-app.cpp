@@ -43,14 +43,17 @@ using namespace std::chrono_literals;
 const char* ADDRESS = "127.0.0.1";
 // Номер порта для отправки
 constexpr auto PORT = 57956;
-// Размер пакета 7 байт заголовки и 1300 байт или меньше сам фрагмент кадра
+// Размер пакета 7 байт - заголовки; 1300 байт - фрагмент кадра
+// Рекомендуется выбирать размер пакета меньше чем MTU чтобы избежать фрагментации
+// 1300 выбрано с запасом под MTU 1500, реальный размер с pppoe может быть меньше
 constexpr auto PACKET_SIZE = 1307;
 
-// Настройка качества сжатия Jpeg, чем выше тем больше размер кадров
+// Настройка качества сжатия Jpeg
 constexpr auto JPEG_QUALITY = 90;
 
 #define Report(x) { printf("Report: %s(%d), hr=0x%08x\n", __FILE__, __LINE__, (x)); }
 
+// Инициализация winsock
 bool sockInit(void) {
 #ifdef _WIN32
     WSADATA wsaData;
@@ -61,7 +64,9 @@ bool sockInit(void) {
 #endif
 }
 
+// Получение сокета для отправки данных
 int createUDPClient(int port) {
+    // Задаем использование UDP
     int sockfd = static_cast<int>(socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP));
     if (sockfd < 0) {
         std::cerr << "Socket creation failed" << std::endl;
@@ -70,9 +75,12 @@ int createUDPClient(int port) {
     return sockfd;
 }
 
+// Функция для упрощения записи 2-х байтных данных в пакет в формате Big-endian
 void writeUINT16BE(uint16_t value, char packet[], int offset) {
+    // Разделяем байты 
     byte low_byte = (byte)(value & 0xFF);
     byte high_byte = (byte)((value >> 8) & 0xFF);
+    // Записываем в пакет
     packet[offset] = high_byte;
     packet[offset+1] = low_byte;
 }
@@ -81,37 +89,52 @@ void writeUINT16BE(uint16_t value, char packet[], int offset) {
 void sendFrame(byte* buffer, size_t buffer_size, int sock) {
 
     sockaddr_in addr;
-    struct in_addr parseAddr;
+    // Получаем адрес из строки
     int s = inet_pton(AF_INET, ADDRESS, &addr.sin_addr);
     if (s <= 0) {
         std::cerr << "Not in presentation format" << std::endl;
         return;
     }
+
     addr.sin_family = AF_INET;
     addr.sin_port = htons(PORT);
     socklen_t addrSize = sizeof(addr);
 
+    // Счетчик текущего кадра
     static uint16_t frame_number = 0;
-    int bytes_left = buffer_size;
+
+    // Счетчик текущего пакета кадра
     uint16_t packet_num = 0;
+
+    // Смещение байтов для записи фрагментов кадра из общего буфера
     int offset = 0;
+
+    // Оставшиеся байты в общем буфере кадра
+    int bytes_left = buffer_size;
 
     while (bytes_left > 0) {
         char packet[PACKET_SIZE];
         uint16_t payload_size = bytes_left > 1300 ? 1300 : bytes_left;
         bool last_packet = bytes_left < 1300;
+        // Записываем размер полезной нагрузки- фрагмента кадра
         writeUINT16BE(payload_size, packet, 0);
+        // Записываем номер текущего кадра
         writeUINT16BE(frame_number, packet, 2);
+        // Записываем номер текущего фрагмента кадра
         writeUINT16BE(packet_num, packet, 4);
+        // Флаг последнего фрагмента, запись bool занимает 1 байт
         packet[6] = last_packet;
 
+        // Копируем данные с буфера в область полезной нагрузки
         memcpy(packet + 7, buffer + offset, payload_size);
 
         packet_num++;
         offset += payload_size;
+        // Отправка пакета
         sendto(sock, packet, 1307, 0, (sockaddr*)&addr, addrSize);
         bytes_left -= payload_size;
     }
+
     frame_number++;
 }
 
@@ -122,6 +145,7 @@ struct Image {
     int rowPitch = 0;
 };
 
+// Получение изображения рабочего стола
 Image captureDesktop(ID3D11DeviceContext* deviceContext, ID3D11Device* device, IDXGIOutputDuplication* outputDuplication) {
     if (device == nullptr) { Report(E_FAIL); return {}; }
 
@@ -208,6 +232,7 @@ Image captureDesktop(ID3D11DeviceContext* deviceContext, ID3D11Device* device, I
     return image;
 }
 
+// Функция конвертирования raw данных в jpeg с помощью библиотеки
 byte* ConvertToJPEG(Image image, tjhandle handle, size_t *buffer_size) {
     byte *buff = nullptr;
 
@@ -222,7 +247,9 @@ byte* ConvertToJPEG(Image image, tjhandle handle, size_t *buffer_size) {
 }
 
 int main() {
+    // Установка кодировки utf-8 в консоли
     SetConsoleOutputCP(CP_UTF8);
+
     if (!sockInit()) {
         std::cerr << "Failed to initialize Winsock\n";
         return -1;
@@ -247,9 +274,9 @@ int main() {
     D3D_FEATURE_LEVEL featureLevel;
     D3D11CreateDevice(
         nullptr,                   // Адаптер
-        D3D_DRIVER_TYPE_HARDWARE, // Тип драйвера
+        D3D_DRIVER_TYPE_HARDWARE,  // Тип драйвера
         nullptr,                   // Без программного устройства
-        0, // Флаги
+        0,                         // Флаги
         nullptr, 0,                // Уровни возможностей
         D3D11_SDK_VERSION,         // Версия SDK
         &d3dDevice,                // Устройство
@@ -282,6 +309,7 @@ int main() {
     file.close();*/
 
     while (true) {
+        // Получаем изображение
         Image result = captureDesktop(d3dContext.Get(), d3dDevice.Get(), duplication.Get());
 
         size_t buffer_size = 0;
@@ -293,7 +321,7 @@ int main() {
             sendFrame(buffer, buffer_size, sock);
             tj3Free(buffer);
         }
-        Sleep(30);
+        Sleep(40);
     }
 
     closesocket(sock);
